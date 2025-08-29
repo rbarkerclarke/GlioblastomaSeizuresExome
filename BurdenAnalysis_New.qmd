@@ -1,0 +1,2009 @@
+---
+title: "BurdenAnalysis"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+## GBM Exome Analysis
+
+Hierarchical clustering (12/1/23) and rare variant burden analysis (5/1/24)
+
+## Setting up packages:
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+require(dplyr)
+require(survminer)
+require(stringr)
+require(pvclust)
+require(survival)
+require(readxl)
+require(readr)
+require(ggplot2)
+require(cluster)
+require(ggdendro)
+require(ggcorrplot)
+library(MesKit)
+library(VariantAnnotation)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
+
+#BiocManager::install("trackViewer")
+#BiocManager::install("TxDb.Hsapiens.UCSC.hg19.knownGene")
+#BiocManager::install("VariantAnnotation")
+#BiocManager::install("org.Hs.eg.db")
+
+
+```
+
+## Utility Functions
+
+Utility functions for removing spaces from column names and returning values for zero sum.\
+
+```{r}
+zero_na = function(num){
+  if (is.na(num)){
+    return(0)
+  }
+  else{
+    return(num)
+  }
+}
+```
+
+```{r}
+library(GenVisR)
+library(trackViewer)
+```
+
+```{r}
+# Install Bioconductor if not already installed
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+```
+
+```{r}
+is_zero <- function(n){
+  val=ifelse(n==0, FALSE, TRUE)
+  return(val)
+}
+
+is_na <- function(n){
+  val=ifelse(!is.na(n), FALSE, TRUE)
+  return(val)
+}
+
+inject.dots <- function(df) {names(df) <- sub(" ", ".", names(df));df}
+```
+
+## Read in and clean data
+
+Read in exome data (Caris) and clinical data (seizure)
+
+```{r}
+Caris = read_excel('CARIS Data_6-2-24 with Clinical Info_deidentified.xlsx', sheet=1)
+clinical = read_excel('CARIS Data_6-2-24 with Clinical Info_deidentified.xlsx', sheet = 2)
+
+
+transcripts = read_excel("Raw CARIS Data_8-18-24_deidentified.xlsx", sheet=1)
+
+transcripts2 = read_excel("Raw CARIS Data_8-18-24_deidentified.xlsx", sheet=2)
+
+transcripts3 = read_excel("Raw CARIS Data_8-18-24_deidentified.xlsx", sheet=3)
+
+transcripts4 = read_excel("Raw CARIS Data_8-18-24_deidentified.xlsx", sheet=4)
+
+names(Caris)=make.names(names(Caris))
+names(clinical)=make.names(names(clinical))
+names(transcripts)=make.names(names(transcripts))
+names(transcripts2)=make.names(names(transcripts2))
+names(transcripts3)=make.names(names(transcripts3))
+names(transcripts4)=make.names(names(transcripts4))
+
+Caris$TP53.Mutation = Caris$TP53.Mutation...564
+Caris = Caris %>% dplyr::select(-c(TP53.Mutation...564, TP53.Mutation...565))
+# Drop and rename duplicate columns
+#Caris <- Caris %>% dplyr::select(-c(`MN1.Fusion...341`,`TP53.Mutation...564`)) %>% rename(`TP53.Mutation`=`TP53.Mutation...565`) %>% rename(`MN1.Fusion`=`MN1.Fusion...342`)
+```
+
+```{r}
+
+# Updated function to handle mixed cases
+classify_mutation <- function(mutation) {
+  parts <- strsplit(mutation, "\\|")[[1]]
+  
+  # Initialize empty
+  protein_change <- ""
+  dna_change <- ""
+  
+  # Assign depending on how many parts exist
+  if (length(parts) == 2) {
+    protein_change <- parts[1]
+    dna_change <- parts[2]
+  } else if (grepl("^c\\.", parts[1])) {
+    dna_change <- parts[1]
+  } else {
+    protein_change <- parts[1]
+  }
+  
+  # Now classify
+  if (grepl("-|\\+", dna_change)) {
+    return("Splice site")
+  } else if (grepl("del|ins", dna_change)) {
+    return("Indel (deletion/insertion)")
+  } else if (grepl("fs", protein_change)) {
+    return("Frameshift")
+  } else if (grepl("\\*", protein_change)) {
+    return("Nonsense (early stop)")
+  } else if (grepl("^[A-Z][0-9]+[A-Z]$", protein_change)) {
+    return("Missense")
+  } else if (grepl("^c\\.", dna_change)) {
+    return("Nucleotide substitution (unknown effect)")
+  } else {
+    return("Unknown")
+  }
+}
+
+# Apply to the dataframe
+transcripts4$mutation_type <- sapply(transcripts4$value, classify_mutation)
+
+```
+
+Add clinical column for presence of any seizures (pre or post diagnosis and surgery)
+
+```{r}
+clinical$Seizure.presentation.ANY = clinical$Seizure.presentation..0.No..1.Yes. | clinical$Seizure.presentation.ONLY.after.surgery
+```
+
+```{r}
+
+library(tidyr)
+
+egfr_mutations = transcripts4 %>% filter(test=="EGFR")
+
+egfr_mutations <- egfr_mutations %>% tidyr::separate_wider_delim(value,  delim="|c.", names=c("protein_change", "variant_description"))
+
+
+# Split into two columns: position and mutation
+#egfr_mutations <- separate(egfr_mutations, variant_description, into = c("Position", "Mutation"), sep = "(?<=[0-9])")
+
+egfr_mutations$Position <- str_extract(egfr_mutations$variant_description, "[0-9]+")
+egfr_mutations$Mutation <- str_extract(egfr_mutations$variant_description, "[A-Za-z]+>[A-Za-z]+")
+
+
+# Display the result
+print(egfr_mutations)
+
+grouped_egfr = egfr_mutations %>% group_by(protein_change,Position) %>% summarise(n=n())
+
+grouped_egfr$Position = as.numeric(grouped_egfr$Position)+55019017
+
+egfr_mutations$Hugo_Symbol = egfr_mutations$test
+egfr_mutations$Protein_Change = egfr_mutations$protein_change
+egfr_mutations$Chromosome = 7
+egfr_mutations$Start_Position = egfr_mutations$Position
+egfr_formatted = egfr_mutations %>% dplyr::select(Hugo_Symbol, Protein_Change, Chromosome, Start_Position)
+write_tsv(egfr_formatted, file = "/Users/stephbc/Desktop/egfr_formatted.tsv")
+
+
+tp53_mutations = transcripts4 %>% filter(test=="TP53")
+
+tp53_mutations <- tp53_mutations %>% tidyr::separate_wider_delim(value,  delim="|c.", names=c("protein_change", "variant_description"), too_few = "align_start")
+
+tp53_mutations$Position <- str_extract(tp53_mutations$variant_description, "[0-9]+")
+tp53_mutations$Mutation <- str_extract(tp53_mutations$variant_description, "[A-Za-z]+>[A-Za-z]+")
+
+tp53_mutations$Hugo_Symbol = tp53_mutations$test
+tp53_mutations$Protein_Change = tp53_mutations$protein_change
+tp53_mutations$Chromosome = 7
+tp53_mutations$Start_Position = tp53_mutations$Position
+tp53_formatted = tp53_mutations %>% dplyr::select(Hugo_Symbol, Chromosome, Start_Position, Protein_Change)
+write_tsv(tp53_formatted, file = "/Users/stephbc/Desktop/tp53_formatted.tsv")
+
+
+
+tert_mutations = transcripts4 %>% filter(test=="TERT")
+
+#tert_mutations <- tert_mutations %>% tidyr::separate_wider_delim(value,  delim="c.", names=c("protein_change", "variant_description"))
+
+tert_mutations$Position <- str_extract(tert_mutations$value, "-[0-9]+")
+tert_mutations$Mutation <- str_extract(tert_mutations$value, "[A-Za-z]+>[A-Za-z]+")
+
+tert_mutations$Hugo_Symbol = tert_mutations$test
+#tert_mutations$Protein_Change = tert_mutations$protein_change
+tert_mutations$Chromosome = 5
+tert_mutations$Start_Position = tert_mutations$Position
+tert_formatted = tert_mutations %>% dplyr::select(Hugo_Symbol, Chromosome, Start_Position)
+write_tsv(tert_formatted, file = "/Users/stephbc/Desktop/tert_formatted.tsv")
+```
+
+## Remove poor quality samples
+
+Samples with TMB/MSI/HLA given as \["NA", "QNS" or "Quality Not Sufficient"\]
+
+```{r}
+Caris <- Caris %>% filter(!(MSI %in% c("NA", "QNS", "Quality Not Sufficient")))
+quality_samples= Caris$Deidentified.code
+
+clinical <- clinical %>% filter(Deidentified.code %in% quality_samples)
+
+transcripts2 <- transcripts2 %>% filter(Deidentified.code %in% quality_samples, test!="NA")%>% unique()
+
+transcripts3 <- transcripts3 %>% filter(Deidentified.code %in% quality_samples,  test!="NA")%>% unique()
+
+transcripts4 <- transcripts4 %>% filter(Deidentified.code %in% quality_samples, test!="NA") %>% unique()
+```
+
+Total variants
+
+```{r}
+nmutations = dim(transcripts4)[1]
+nfusions = dim(transcripts3)[1]
+ncopynumbers = dim(transcripts2)[1]
+
+ngenes_mutations = length(unique(transcripts4$test))
+ngenes_fusions = length(unique(transcripts3$test))
+ngenes_cnas = length(unique(transcripts2$test))
+nmutations + nfusions + ncopynumbers
+```
+
+Count incidences per column
+
+```{r}
+id_cols = c("Deidentified.code","TMB","MSI","LOH","HLA.A","HLA.B","HLA.C")
+
+allcounts <- colSums((Caris != 0))
+varcounts_genes <- colSums((Caris %>% dplyr::select(-all_of(id_cols)) != 0))
+unique_values_per_column <- lapply(Caris, unique)
+varcounts_pp <- apply(Caris %>% dplyr::select(-all_of(id_cols)), 1, function(row) sum(row != 0))
+```
+
+Remove zero counts (sequenced genes with no mutation, copy number change or fusion events across the cohort)
+
+```{r}
+
+
+Caris_red <- Caris[allcounts>0]
+Caris_red <- Caris_red %>% na.omit()
+
+#Recode LOH factors
+Caris_red$LOH=ifelse(Caris_red$LOH %in% c('Quality Not Sufficient','QNS','NA'), 
+                     NA, Caris_red$LOH)
+Caris_red$MSI=ifelse(Caris_red$MSI %in% c('Quality Not Sufficient','QNS','NA'), 
+                     NA, Caris_red$MSI)
+# Recode TMB
+Caris_red$TMB_numeric = as.numeric(substr(Caris_red$TMB,1,2))
+
+# Specific columns and counts
+cn_columns <- grep("CN", names(Caris_red), value = TRUE)
+varcounts_cn <-  colSums(Caris %>% dplyr::select(contains("CNA")) != 0)
+  
+fusion_columns <- grep("Fusion", names(Caris_red), value = TRUE)
+varcounts_fusion <-  colSums(Caris %>% dplyr::select(contains("Fusion")) != 0)
+fusion_pp <- rowSums(Caris %>% dplyr::select(contains("Fusion")) != 0)
+
+mut_columns <-  grep("Mutation", names(Caris_red), value = TRUE)
+varcounts_mut <-  colSums(Caris %>% dplyr::select(contains("Mutation")) != 0)
+mutation_pp <- rowSums(Caris %>% dplyr::select(contains("Mutation")) != 0)
+
+egfr_columns <-  grep("EGFR", names(Caris_red), value = TRUE)
+```
+
+```{r}
+mut_total_df = transcripts4 %>% dplyr::select(Deidentified.code, test, value, mutation_type) %>% unique() %>% group_by(Deidentified.code) %>% summarise(n_mutations=n())
+
+fus_total_df = transcripts3 %>% dplyr::select(Deidentified.code, test, value) %>% unique() %>% group_by(Deidentified.code) %>% summarise(n_fusions=n())
+
+cn_total_df = transcripts2 %>% dplyr::select(Deidentified.code, test) %>% unique() %>% group_by(Deidentified.code) %>% summarise(n_cns=n())
+
+Caris_red = left_join(Caris_red, mut_total_df)
+Caris_red = left_join(Caris_red, fus_total_df)
+Caris_red = left_join(Caris_red, cn_total_df)
+
+```
+
+Create per patient sample data frame (pp_df)
+
+```{r}
+# Add row sums 
+pp_df <- data.frame(Deidentified.code=Caris_red$Deidentified.code, fusions = rowSums(Caris_red %>% dplyr::select(contains("Fusion")) != 0), CNAs = rowSums(Caris_red %>% dplyr::select(contains("CNA")) != 0), muts = rowSums(Caris_red %>% dplyr::select(contains("Mutation")) != 0))
+
+# Add gene information
+pp_df<- left_join(pp_df, Caris_red)
+
+# Add clinical
+pp_df <- left_join(pp_df, clinical %>% dplyr::select(Deidentified.code, age, sex, kps_at_diagnosis,Seizure.presentation..0.No..1.Yes., Seizure.presentation.ONLY.after.surgery,Seizure.freq.AVG.over.1st.6.mo, Keppra, Vimpat, Zonegran, Lamictal, race,ki_67, idh1_mutated,mgmt_methylated, p53_percent_reactivity, loc_other, loc_frontal, loc_parietal, loc_occipital, loc_temporal))
+
+# Full
+Caris_clinical <- left_join(Caris_red %>% na.omit(), clinical) 
+
+pp_df <- pp_df %>% mutate(NEL = ifelse(Seizure.presentation..0.No..1.Yes.,"Early", ifelse(Seizure.presentation.ONLY.after.surgery, "Late", "None")))
+```
+
+Two Way Anova
+
+```{r}
+library("ggpubr")
+ggline(pp_df, x = "NEL", y = "muts", color = "TP53.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800")) + ylab("Single Nucleotide Variants")
+
+res.aov2 <- aov(muts ~ NEL + TP53.Mutation, data = pp_df)
+summary(res.aov2)
+
+ggline(pp_df, x = "NEL", y = "muts", color = "IDH1.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800"))
+
+res.aov2 <- aov(muts ~ NEL + IDH1.Mutation, data = pp_df)
+summary(res.aov2)
+
+ggline(pp_df, x = "NEL", y = "muts", color = "EGFR.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#AF89BB"))
+
+res.aov2 <- aov(muts ~ NEL + EGFR.Mutation, data = pp_df)
+summary(res.aov2)
+
+
+ggline(pp_df, x = "NEL", y = "muts", color = "PTEN.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#AF89BB"))
+
+res.aov2 <- aov(muts ~ NEL + PTEN.Mutation + NEL:PTEN.Mutation, data = pp_df)
+summary(res.aov2)
+
+
+ggline(pp_df, x = "NEL", y = "muts", color = "EGFR.Fusion",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800"))
+
+res.aov2 <- aov(muts ~ NEL + EGFR.Fusion + NEL:EGFR.Fusion, data = pp_df)
+summary(res.aov2)
+
+
+ggline(pp_df, x = "NEL", y = "muts", color = "EGFR.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#AF89BB"))
+
+res.aov2 <- aov(muts ~ NEL + EGFR.Mutation + NEL:EGFR.Mutation, data = pp_df)
+summary(res.aov2)
+
+
+ggline(pp_df, x = "NEL", y = "muts", color = "TP53.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800"))
+
+res.aov2 <- aov(muts ~ NEL + TP53.Mutation + NEL:TP53.Mutation, data = pp_df)
+summary(res.aov2)
+
+pp_df$ki_67=as.numeric(pp_df$ki_67)
+ggline(pp_df, x = "NEL", y = "ki_67", color = "IDH1.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800"))
+
+res.aov2 <- aov(ki_67 ~ NEL + IDH1.Mutation + NEL:IDH1.Mutation, data = pp_df)
+summary(res.aov2)
+
+pp_df$ki_67=as.numeric(pp_df$ki_67)
+ggline(pp_df, x = "NEL", y = "ki_67", color = "EGFR.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#FFCCCA"))
+
+res.aov2 <- aov(ki_67 ~ NEL + EGFR.Mutation + NEL:EGFR.Mutation, data = pp_df)
+summary(res.aov2)
+
+
+ggline(pp_df, x = "NEL", y = "TMB_numeric", color = "PTEN.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#FFCCCA"))
+
+res.aov2 <- aov(TMB_numeric ~ NEL + PTEN.Mutation + NEL:PTEN.Mutation, data = pp_df)
+summary(res.aov2)
+
+ggline(pp_df %>% dplyr::filter(mgmt_methylated %in% c("0","1")), x = "NEL", y = "TMB_numeric", color = "mgmt_methylated",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#FFCCCA"))
+
+res.aov2 <- aov(muts ~ NEL + mgmt_methylated + NEL:mgmt_methylated, data = pp_df)
+summary(res.aov2)
+
+
+ggline(pp_df %>% dplyr::filter(mgmt_methylated %in% c("0","1")), x = "NEL", y = "TMB_numeric", color = "mgmt_methylated",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#FFCCCA"))
+
+res.aov2 <- aov(TMB_numeric ~ NEL + mgmt_methylated + NEL:mgmt_methylated, data = pp_df)
+summary(res.aov2)
+
+
+ggline(pp_df %>% dplyr::filter(EGFR.Mutation!="VUS"), x = "NEL", y = "TMB_numeric", color = "EGFR.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#FFCCCA"))
+
+res.aov2 <- aov(TMB_numeric ~ NEL + EGFR.Mutation + NEL:EGFR.Mutation, data = pp_df)
+summary(res.aov2)
+
+ggline(pp_df %>% dplyr::filter(EGFR.Mutation!="VUS"), x = "NEL", y = "Seizure.freq.AVG.over.1st.6.mo", color = "EGFR.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#FFCCCA"))
+
+res.aov2 <- aov(Seizure.freq.AVG.over.1st.6.mo ~ NEL + EGFR.Mutation + NEL:EGFR.Mutation, data = pp_df)
+summary(res.aov2)
+
+ggline(pp_df %>% dplyr::filter(PTEN.Mutation!="VUS"), x = "NEL", y = "Seizure.freq.AVG.over.1st.6.mo", color = "PTEN.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#FFCCCA"))
+
+res.aov2 <- aov(Seizure.freq.AVG.over.1st.6.mo ~ NEL + PTEN.Mutation + NEL:PTEN.Mutation, data = pp_df)
+summary(res.aov2)
+
+
+ggline(pp_df %>% dplyr::filter(PTEN.Mutation!="VUS"), x = "NEL", y = "kps_at_diagnosis", color = "PTEN.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#FFCCCA"))
+
+res.aov2 <- aov(kps_at_diagnosis ~ NEL + PTEN.Mutation + NEL:PTEN.Mutation, data = pp_df)
+summary(res.aov2)
+
+ggline(pp_df %>% dplyr::filter(EGFR.Mutation!="VUS"), x = "NEL", y = "kps_at_diagnosis", color = "EGFR.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#FFCCCA"))
+
+res.aov2 <- aov(kps_at_diagnosis ~ NEL + EGFR.Mutation + NEL:EGFR.Mutation, data = pp_df)
+summary(res.aov2)
+
+
+ggline(pp_df %>% dplyr::filter(TERT.Mutation!="VUS"), x = "NEL", y = "TMB_numeric", color = "TERT.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#FFCCCA"))
+
+res.aov2 <- aov(TMB_numeric ~ NEL + TERT.Mutation + NEL:TERT.Mutation, data = pp_df)
+summary(res.aov2)
+
+ggline(pp_df %>% dplyr::filter(NF1.Mutation!="VUS"), x = "NEL", y = "TMB_numeric", color = "NF1.Mutation",
+       add = c("mean_se", "dotplot"),
+       palette = c("#00AFBB", "#E7B800", "#FFCCCA"))
+
+res.aov2 <- aov(TMB_numeric ~ NEL + NF1.Mutation + NEL:NF1.Mutation, data = pp_df)
+summary(res.aov2)
+
+```
+
+```{r}
+library(ggplot2)
+library(car)        # For Levene's Test
+library(ggpubr)     # For stat_compare_means()
+library(dplyr)
+
+# Make sure the factors are correctly specified
+pp_df$NF1.Mutation <- as.factor(pp_df$NF1.Mutation)
+pp_df$NEL <- as.factor(pp_df$NEL)  # Replace with your second factor
+
+# Two-way ANOVA
+anova_model <- aov(muts ~ NEL, data = pp_df)
+summary(anova_model)
+
+# Assumption 1: Normality of residuals
+par(mfrow = c(1, 2))
+plot(anova_model, which = 2)  # Q-Q plot of residuals
+shapiro.test(residuals(anova_model))  # Shapiro-Wilk test
+
+# Assumption 2: Homogeneity of variances
+leveneTest(muts ~ NEL, data = pp_df)
+
+# Optional: Reset plotting layout
+par(mfrow = c(1, 1))
+```
+
+```{r}
+# Install WRS2 if needed
+install.packages("WRS2")
+library(WRS2)
+
+pp_clean <- na.omit(pp_df[, c("muts", "TP53.Mutation", "NEL")])
+
+
+pp_clean$TP53.Mutation <- as.factor(pp_clean$TP53.Mutation)
+pp_clean$NEL <- as.factor(pp_clean$NEL)
+pp_clean$muts <- as.numeric(pp_clean$muts)
+
+# Robust two-way ANOVA (trimmed means approach)
+t2way(muts ~ TP53.Mutation * NEL, data = pp_clean)
+
+
+pp_clean <- na.omit(pp_df[, c("muts", "IDH1.Mutation", "NEL")])
+
+
+pp_clean$IDH1.Mutation <- as.factor(pp_clean$IDH1.Mutation)
+pp_clean$NEL <- as.factor(pp_clean$NEL)
+pp_clean$muts <- as.numeric(pp_clean$muts)
+
+# Robust two-way ANOVA (trimmed means approach)
+t2way(muts ~ IDH1.Mutation * NEL, data = pp_clean)
+
+
+pp_clean <- na.omit(pp_df[, c("muts", "CNAs", "fusions", "EGFR.CNA.CND", "NEL", "kps_at_diagnosis")])
+pp_clean <- pp_clean %>% dplyr::filter(EGFR.CNA.CND!=0)
+
+
+pp_clean$EGFR.CNA.CND <- as.factor(pp_clean$EGFR.CNA.CND)
+pp_clean$NEL <- as.factor(pp_clean$NEL)
+pp_clean$muts <- as.numeric(pp_clean$muts)
+
+# Robust two-way ANOVA (trimmed means approach)
+t2way(kps_at_diagnosis ~ EGFR.CNA.CND * NEL, data = pp_clean)
+
+```
+
+```{r}
+ggplot(data=pp_df) + geom_boxplot(aes(fill=as.factor(TP53.Mutation), y=muts)) 
+
+ggplot(data = pp_df, aes(x = as.factor(TP53.Mutation), y = CNAs, fill = as.factor(TP53.Mutation))) +
+  geom_boxplot() +
+  stat_compare_means(method = "anova", label.y = max(pp_df$CNAs, na.rm = TRUE) * 1.05) +
+  labs(x = "TP53 Mutation", y = "Copy Number Variants", fill = "TP53 Mutation") +
+  theme_minimal()
+
+ggplot(data = pp_df, aes(x = as.factor(TP53.Mutation), y = muts, fill = as.factor(TP53.Mutation))) +
+  geom_boxplot() +
+  stat_compare_means(method = "anova", label.y = max(pp_df$muts, na.rm = TRUE) * 1.05) +
+  labs(x = "TP53 Mutation", y = "Single Nucleotide Variants", fill = "TP53 Mutation") +
+  theme_minimal()
+
+ggplot(data = pp_df, aes(x = as.factor(EGFR.Mutation), y = muts, fill = as.factor(EGFR.Mutation))) +
+  geom_boxplot() +
+  stat_compare_means(method = "anova", label.y = max(pp_df$muts, na.rm = TRUE) * 1.05) +
+  labs(x = "EGFR Mutation", y = "Single Nucleotide Variants", fill = "EGFR Mutation") +
+  theme_minimal()
+
+ggplot(data = pp_df %>% dplyr::filter(NEL=="Early"), aes(x = as.factor(PTEN.Mutation), y = muts, fill = as.factor(PTEN.Mutation))) +
+  geom_boxplot() +
+  stat_compare_means(method = "anova", label.y = max(pp_df$muts, na.rm = TRUE) * 1.05) +
+  labs(x = "PTEN Mutation", y = "Single Nucleotide Variants", fill = "PTEN Mutation") +
+  theme_minimal()
+
+
+ggplot(data = pp_df, aes(x = as.factor(TP53.Mutation), y = fusions, fill = as.factor(TP53.Mutation))) +
+  geom_boxplot() +
+  stat_compare_means(method = "anova", label.y = max(pp_df$fusions, na.rm = TRUE) * 1.05) +
+  labs(x = "TP53 Mutation", y = "Fusions", fill = "TP53 Mutation") +
+  theme_minimal()
+
+# Create the boxplot and add ANOVA p-value
+ggplot(data = pp_df, aes(x = as.factor(NF1.Mutation), y = fusions, fill = as.factor(NF1.Mutation))) +
+  geom_boxplot() +
+  stat_compare_means(method = "anova", label.y = max(pp_df$fusions, na.rm = TRUE) * 1.05) +
+  labs(x = "NF1 Mutation", y = "Fusions", fill = "NF1 Mutation") +
+  theme_minimal()
+
+```
+
+Chi-squared test for properties of WES cohort
+
+```{r}
+sei_full = c(536, 261, 153) # All patients with No, Early, Late
+sei_WES = c(36, 29, 18) # Whole Exome patients with No, Early,Late
+sei_diff = sei_full-sei_WES
+
+ctable =matrix(c(sei_diff, sei_WES), ncol=2)
+ct = chisq.test(ctable)
+print(ct$observed)
+print(ct$expected)
+
+
+
+```
+
+```         
+```
+
+## LDA Example
+
+```{r, eval=FALSE}
+library(tidyverse)
+library(caret)
+theme_set(theme_classic())
+
+# Load the data
+#data("iris")
+
+# Split the data into training (80%) and test set (20%)
+set.seed(123)
+training.samples <- pp_df$NEL %>%
+  createDataPartition(p = 0.8, list = FALSE)
+train.data <- pp_df[training.samples, ]
+test.data <- pp_df[-training.samples, ]
+#Normalize the data. Categorical variables are automatically ignored.
+# Estimate preprocessing parameters
+preproc.param <- train.data %>% 
+  preProcess(method = c("center", "scale"))
+# Transform the data using the estimated parameters
+train.transformed <- preproc.param %>% predict(train.data)
+test.transformed <- preproc.param %>% predict(test.data)
+```
+
+```{r, eval=FALSE}
+library(MASS)
+# Fit the model
+model <- lda(NEL~kps_at_diagnosis, data = train.transformed,)
+# Make predictions
+predictions <- model %>% predict(test.transformed)
+# Model accuracy
+mean(predictions$class==test.transformed$NEL)
+
+```
+
+Genes in each class
+
+```{r}
+length(varcounts_fusion!=0)
+length(varcounts_mut!=0)
+length(varcounts_cn!=0)
+
+sum(varcounts_fusion!=0)
+sum(varcounts_mut!=0)
+sum(varcounts_cn!=0)
+```
+
+```{r}
+mut_top_full = names(sort(varcounts_mut, decreasing=TRUE)[1:20])
+cn_top_full = names(sort(varcounts_cn, decreasing=TRUE)[1:20])
+
+cn_top = sort(varcounts_cn, decreasing=TRUE)[1:10]
+mut_top = sort(varcounts_mut, decreasing=TRUE)[1:10]
+fus_top = sort(varcounts_fusion, decreasing=TRUE)[1:5]
+
+mut_top = sub(".Mutation", "", names(mut_top))
+fus_top = sub(".Fusion", "", names(fus_top))
+cn_top = sub(".CNA.CND", "", names(cn_top))
+```
+
+## Plotting exome variations per sample
+
+```{r}
+
+pp_df <- data.frame(Deidentified.code=Caris_red$Deidentified.code, fusions = rowSums(Caris_red %>% dplyr::select(contains("Fusion")) != 0), CNAs = rowSums(Caris_red %>% dplyr::select(contains("CNA")) != 0), muts = rowSums(Caris_red %>% dplyr::select(contains("Mutation")) != 0))
+
+# Add gene information
+pp_df<- left_join(pp_df, Caris_red)
+
+# Add clinical
+pp_df <- left_join(pp_df, clinical %>% dplyr::select(Deidentified.code, age, sex, kps_at_diagnosis,Seizure.presentation..0.No..1.Yes., Seizure.presentation.ONLY.after.surgery, Seizure.presentation.ANY,Seizure.freq.AVG.over.1st.6.mo, Keppra, Vimpat, Zonegran, Lamictal, race,ki_67, idh1_mutated,mgmt_methylated, p53_percent_reactivity, loc_other, loc_frontal, loc_parietal, loc_occipital, loc_temporal))
+
+# Full
+Caris_clinical <- left_join(Caris_red %>% na.omit(), clinical) 
+
+ggplot(pp_df, aes(y=n_cns, x=as.factor(is.na(p53_percent_reactivity)))) +
+  geom_boxplot(fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(x='', y = "Frequency") + 
+  theme_minimal() 
+ggsave(file="fusions.png", width=2, height=4, dpi=300)
+
+```
+
+Validation plot of mutations per sample by MSI, high -\> high mutation number.
+
+```{r, echo=FALSE}
+# Create a data frame for ggplot
+#pp_df 
+summary(pp_df$muts)
+summary(pp_df$fusions)
+summary(pp_df$CNAs)
+
+
+# Medians 
+summary(pp_df$n_mutations)
+summary(pp_df$n_fusions)
+summary(pp_df$n_cns)
+
+# Convert categorical seizure to multi
+pp_df$Sz_Pre_Diagnosis = pp_df$Seizure.presentation..0.No..1.Yes.
+pp_df <- pp_df |> mutate(CodeSeizure=Sz_Pre_Diagnosis*1 + Seizure.presentation.ONLY.after.surgery*2) |> mutate(CodeSeizure=as.factor(CodeSeizure))
+
+
+# Wide to Long
+pp_df_long <- tidyr::pivot_longer(pp_df, cols=c('muts', 'fusions', 'CNAs'), names_to = "type", values_to = "count")
+
+# Plot histogram of counts within MSI classes
+ggplot(pp_df_long, aes(x=MSI, y=count, color=type)) +
+  geom_boxplot(alpha = 0.7, notch=TRUE) +
+  labs(x='', y = "Count per Sample") 
+  #theme_minimal() 
+
+
+# Plot histogram of counts per sample
+ggplot(pp_df_long %>% filter(!is.na(CodeSeizure)), aes(x=type, y=count, col=CodeSeizure)) +
+  geom_boxplot(alpha = 0.7, notch=FALSE) +
+  labs(x='', y = "Gene Count per Sample")+
+  theme_minimal()  + scale_color_discrete(labels=c("No Seizure","Early Seizure","Late Seizure"))+scale_x_discrete(labels=c("Copy Number","Fusions","Mutations"))+labs(colour = "Seizure Incidence", x=c("Variation Type"))
+
+ggsave(file="genecount_CN_mut_fus.png", width=6, height=4, dpi=300)
+
+kruskal.test(count ~ CodeSeizure,data=pp_df_long %>% filter(!is.na(CodeSeizure), type=="fusions"))
+
+kruskal.test(count ~ CodeSeizure,data=pp_df_long %>% filter(!is.na(CodeSeizure), type=="CNAs"))
+
+kruskal.test(count ~ CodeSeizure,data=pp_df_long %>% filter(!is.na(CodeSeizure), type=="muts"))
+
+
+
+
+# Wide to Long
+pp_df_long <- tidyr::pivot_longer(pp_df, cols=c('n_mutations', 'n_fusions', 'n_cns'), names_to = "type", values_to = "count")
+
+# Plot histogram of counts within MSI classes
+ggplot(pp_df_long, aes(x=MSI, y=count, color=type)) +
+  geom_boxplot(alpha = 0.7, notch=TRUE) +
+  labs(x='', y = "Count per Sample") 
+  #theme_minimal() 
+
+
+# Plot histogram of counts per sample
+ggplot(pp_df_long %>% filter(!is.na(CodeSeizure)), aes(x=type, y=count, col=CodeSeizure)) +
+  geom_boxplot(alpha = 0.7, notch=FALSE) +
+  labs(x='', y = "Gene Count per Sample")+
+  theme_minimal()  + scale_color_discrete(labels=c("No Seizure","Early Seizure","Late Seizure"))+scale_x_discrete(labels=c("Copy Number","Fusions","Mutations"))+labs(colour = "Seizure Incidence", x=c("Variation Type"))
+
+ggsave(file="allcount_CN_mut_fus.png", width=6, height=4, dpi=300)
+
+kruskal.test(count ~ CodeSeizure,data=pp_df_long %>% filter(!is.na(CodeSeizure), type=="n_fusions"))
+
+kruskal.test(count ~ CodeSeizure,data=pp_df_long %>% filter(!is.na(CodeSeizure), type=="n_cns"))
+
+kruskal.test(count ~ CodeSeizure,data=pp_df_long %>% filter(!is.na(CodeSeizure), type=="n_mutations"))
+```
+
+```{r}
+ggplot(pp_df, aes(x=n_fusions, y=n_mutations)) + geom_point(color = "black", alpha = 0.7) + labs(x='', y = "Count per Sample")+ theme_minimal()
+
+cor.test(pp_df$n_cns, pp_df$n_fusions, method = 'spearman')
+
+cor_matrix = cor(pp_df %>% dplyr::select(c(TMB_numeric,'muts', 'fusions','CNAs','age', 'ki_67', "n_mutations", "n_cns", "n_fusions"))%>% dplyr::mutate(ki_67=as.numeric(ki_67)), use = 'pairwise.complete.obs', method = "spearman")
+
+ggcorrplot(cor_matrix, type = 'lower',method = 'square',lab = TRUE,hc.order = TRUE)
+
+ggsave("correlation_GBM.png")
+
+cor_test =cor(pp_df %>% dplyr::select(c(TMB_numeric,'muts', 'fusions','CNAs','age', 'ki_67', "n_mutations", "n_cns", "n_fusions")) %>% dplyr::mutate(ki_67=as.numeric(ki_67)),use = 'pairwise.complete.obs',method = "spearman")
+
+
+```
+
+## Heatmaps of exome data
+
+```{r, eval=TRUE}
+
+mut_df = pp_df %>% dplyr::select(mut_columns) #%>% dplyr::select(-doubleton_mutations)
+names(mut_df) = sub(".Mutation*", "", names(mut_df))
+
+hm2 = ComplexHeatmap::Heatmap(mut_df,  name = "Mutations", column_names_gp = grid::gpar(fontsize = 6, fontface = "bold"))
+
+fus_df = pp_df %>% dplyr::select(fusion_columns) #%>% dplyr::select(-doubleton_fusions)
+names(fus_df) = sub(".Fusion*", "", names(fus_df))
+
+cn_df = pp_df %>% dplyr::select(cn_columns) #%>% dplyr::select(-doubleton_cnas)
+names(cn_df)=sub(".CNA.CND*", "", names(cn_df))
+
+hm3 = ComplexHeatmap::Heatmap(fus_df, name = "Fusions", column_names_gp = grid::gpar(fontsize = 6, fontface = "bold"))
+hm1 = ComplexHeatmap::Heatmap(cn_df, name = "CN Alterations", column_names_gp = grid::gpar(fontsize = 6, fontface = "bold"), row_title_side = 'left', row_title="",row_dend_reorder = TRUE)
+
+clinical <- clinical %>% filter(!is.na(Seizure.presentation..0.No..1.Yes.))
+post_var = as.factor(clinical$Seizure.presentation.ONLY.after.surgery)
+pre_var = as.factor(clinical$Seizure.presentation..0.No..1.Yes.)
+any_var = as.factor(clinical$Seizure.presentation..0.No..1.Yes. | clinical$Seizure.presentation.ONLY.after.surgery) 
+
+
+#total_var = reduced_varcounts_pp
+burden =log10(clinical$Seizure.freq.AVG.over.1st.6.mo+.01)
+ha0 = ComplexHeatmap::rowAnnotation(SeizureBurden=burden) 
+ha=ComplexHeatmap::rowAnnotation(Seizure=any_var) 
+ha2=ComplexHeatmap::rowAnnotation(Seizure=pre_var) 
+#, left_annotation = ha)
+
+ha2 + ha0+ hm1 + hm2 + hm3
+
+#seisure_control = clinical$Any.remission..6mo...end.date - clinical$Any.remission.of.seizure...6mo...start.date
+clinical$kps_at_diagnosis
+clinical$ki_67
+```
+
+```{r}
+library(ComplexHeatmap)
+first.word <- function(my.string){
+    unlist(strsplit(my.string, " "))[1]
+}
+```
+
+```{r}
+#Heatmap(cn_df%>% dplyr::select(-id_cols), name = "mat", column_title = "default reordering")
+any_seizure = (clinical$Seizure.presentation..0.No..1.Yes. | clinical$Seizure.presentation.ONLY.after.surgery)
+split = ifelse(any_seizure, ifelse(clinical$Seizure.presentation..0.No..1.Yes., 'Early', 'Late'),'None')
+
+cn_colors = c("orange", "slateblue", "yellow","skyblue")
+names(cn_colors) = c("Deleted", "Amplified","Intermediate","0")
+cn_top = sub(".CNA.CND*", "", cn_top)
+
+#row_dend = dendsort(hclust_cn)
+hm_cn = ComplexHeatmap::Heatmap(cn_df %>% dplyr::select(cn_top), name = "CN Alterations", row_split=split,
+                column_names_gp = gpar(fontsize = 8, fontface = "bold"), #cluster_columns = col_dend,
+    column_title = "CNAs", col=cn_colors)
+
+
+hm_mut = ComplexHeatmap::Heatmap(mut_df %>% dplyr::select(mut_top), name = "SNVs", row_split=split,
+                column_names_gp = gpar(fontsize = 8, fontface = "bold"), #cluster_columns = col_dend,
+    column_title = "SNVs",col=c("skyblue", "cornflowerblue", "yellow"))
+
+tmi_vals=log(as.numeric(unname(sapply(pp_df$TMB, first.word))))
+mgmt_vals = as.factor(as.integer(clinical$mgmt_methylated))
+
+anno_ = rowAnnotation(MGMT=mgmt_vals, LogTMB=tmi_vals)
+
+fusion_colors =c("skyblue", "cornflowerblue", "yellow")
+names(fusion_colors) =c("0","Pathogenic Isoform","Unclassified")
+hm_fus = ComplexHeatmap::Heatmap(fus_df %>% dplyr::select(fus_top[c(1,2)]), name = "Fusions", 
+    row_split=split,
+    column_names_gp = gpar(fontsize = 8, fontface = "bold"),
+    column_title = "Fusions",
+    right_annotation = anno_,
+    col=fusion_colors)
+
+#png(filename = "heatmap_top.png", width=25, height=15, units = "cm", res=250, type = "cairo")
+
+p <- hm_mut+hm_cn + hm_fus
+p
+
+
+#dev.off()
+```
+
+```{r}
+heatmap(table(transcripts4$Deidentified.code, transcripts4$mutation_type), labRow = split )
+
+```
+
+```{r}
+length(split)
+fus_df[split=="Late",]
+```
+
+```{r}
+library(ComplexHeatmap)
+library(PerformanceAnalytics)
+library(gpairs)
+library(GGally)
+
+pp_df$n_cns = unlist(lapply(pp_df$n_cns, zero_na))
+pp_df$n_fusions = unlist(lapply(pp_df$n_fusions, zero_na))
+cont_df = pp_df %>% dplyr::filter(IDH1.Mutation=="0") %>% dplyr::select(c(TMB_numeric,kps_at_diagnosis, Seizure.freq.AVG.over.1st.6.mo, 'n_mutations', 'n_fusions', 'n_cns','age', CodeSeizure, mgmt_methylated, sex)) %>% mutate(sex=as.factor(sex), TMB_numeric=log1p(TMB_numeric), n_mutations=log1p(n_mutations), n_cns=log1p(n_cns), n_fusions=log1p(n_fusions)) %>% filter(!is.na(TMB_numeric)) %>% dplyr::rename(TMB=TMB_numeric, SeizureFreq = Seizure.freq.AVG.over.1st.6.mo, KPS=kps_at_diagnosis, Age=age, NSNVs=n_mutations, NFusions=n_fusions, NCNAs=n_cns)
+#chart.Correlation(cont_df, method = "s")
+g1=ggpairs(cont_df %>% filter(!is.na(CodeSeizure)) %>% dplyr::select(-c("sex", "mgmt_methylated")), ggplot2::aes(colour=as.factor(CodeSeizure), alpha=0.7), upper = list(continuous = wrap("cor", size = 3, method="spearman")))+ theme(axis.text = element_text(size = 8))
+ggsave("CorrelationContinuous_GBM_Seizure_Overall_NEWnoIDH.png", plot = g1, dpi=300, width=9, height=9)
+```
+
+```{r, fig.width=10, fig.height=10}
+library(PerformanceAnalytics)
+library(gpairs)
+library(GGally)
+cont_df = pp_df %>% dplyr::select(c(Seizure.freq.AVG.over.1st.6.mo, TMB_numeric, kps_at_diagnosis,'n_mutations', 'n_fusions','n_cns','age', CodeSeizure, mgmt_methylated, sex)) %>% mutate(sex=as.factor(sex)) %>% mutate(sex=as.factor(sex), TMB_numeric=log1p(TMB_numeric), n_mutations=log1p(n_mutations), n_fusions=log1p(n_fusions), n_cns=log1p(n_cns)) %>% filter(!is.na(TMB_numeric)) %>% dplyr::rename(TMB=TMB_numeric, SeizureFreq = Seizure.freq.AVG.over.1st.6.mo, KPS=kps_at_diagnosis, Age=age, SNVs=n_mutations, Fusions=n_fusions, CNAs=n_cns, NEL=CodeSeizure) %>% mutate(SeizureFreq=log1p(SeizureFreq))
+#chart.Correlation(cont_df, method = "s")
+g1=ggpairs(cont_df %>% filter(!is.na(NEL)) %>% dplyr::select(-c("sex", "mgmt_methylated")), ggplot2::aes(colour=as.factor(NEL), alpha=0.8),upper = list(continuous = wrap("cor", size = 3, method="spearman")), lower = list(combo = wrap("facethist", bins = 10), discrete = wrap("facethist", bins = 10)))+ theme(axis.text = element_text(size = 7.5))
+ggsave("CorrelationContinuous_GBM_Seizure_Overall_PREV.png", plot = g1, dpi=300, width=9, height=10)
+
+```
+
+```{r}
+library(PerformanceAnalytics)
+library(gpairs)
+library(GGally)
+
+```
+
+```{r}
+#Add singleton/doubleton
+
+fusion_cols = pp_df %>% dplyr::select(contains(".Fusion"))
+singleton_fusions = names(fusion_cols[colSums(pp_df %>% dplyr::select(contains(".Fusion")) != 0)==1])
+pp_df$singleton_fusion = rowSums(pp_df %>% dplyr::select(all_of(singleton_fusions))!=0)
+doubleton_fusions = names(fusion_cols[colSums(pp_df %>% dplyr::select(contains(".Fusion")) != 0)==2])
+pp_df$doubleton_fusion = rowSums(pp_df %>% dplyr::select(all_of(doubleton_fusions))!=0)
+
+mutation_cols = pp_df %>% dplyr::select(contains("Mutation"))
+singleton_mutations = names(mutation_cols[colSums(mutation_cols != 0)==1])
+pp_df$singleton_mutation = rowSums(pp_df %>% dplyr::select(all_of(singleton_mutations))!=0)
+doubleton_mutations = names(mutation_cols[colSums(mutation_cols != 0)==2])
+pp_df$doubleton_mutation = rowSums(pp_df %>% dplyr::select(all_of(doubleton_mutations))!=0)
+
+cna_cols = pp_df %>% dplyr::select(contains("CNA"))
+singleton_cnas = names(cna_cols[colSums(cna_cols != 0)==1])
+pp_df$singleton_cnas = rowSums(pp_df %>% dplyr::select(all_of(singleton_cnas))!=0)
+doubleton_cnas = names(cna_cols[colSums(cna_cols != 0)==2])
+pp_df$doubleton_cnas = rowSums(pp_df %>% dplyr::select(all_of(doubleton_cnas))!=0)
+```
+
+```{r}
+length(singleton_cnas)
+length(singleton_fusions)
+length(singleton_mutations)
+length(doubleton_cnas)
+length(doubleton_fusions)
+length(doubleton_mutations)
+```
+
+```{r}
+library(PerformanceAnalytics)
+library(gpairs)
+
+singletondoubleton_df = pp_df %>% dplyr::select('muts',doubleton_mutation, singleton_mutation, 'fusions', doubleton_fusion, singleton_fusion, 'CNAs', doubleton_cnas, singleton_cnas, kps_at_diagnosis, CodeSeizure, Seizure.freq.AVG.over.1st.6.mo, sex, age, mgmt_methylated) 
+
+singletondoubleton_df <- singletondoubleton_df %>% dplyr::rename(KPS=kps_at_diagnosis, Sex=sex, Age=age, Mutations=muts, Fusions=fusions, Seizure.freq=Seizure.freq.AVG.over.1st.6.mo) %>% mutate(rare_mut=singleton_mutation+doubleton_mutation, rare_fus = doubleton_fusion+singleton_fusion, rare_cna=doubleton_cnas+singleton_cnas) %>% mutate(rare_fus=rare_fus/sum(rare_fus), rare_mut=rare_mut/sum(rare_mut), rare_cna=rare_cna/sum(rare_cna), rare_all = rare_cna+rare_mut+rare_fus) %>% dplyr::select(rare_all, rare_mut, rare_fus, rare_cna, Age, Sex, KPS, Seizure.freq, CodeSeizure,mgmt_methylated)
+
+
+```
+
+Fisher exact test for association between LOH and frequency of exome variation
+
+```{r}
+dat = pp_df %>% dplyr::select(c(LOH, n_mutations)) %>% dplyr::mutate(mut_high=n_mutations>2) %>% na.omit()
+table(dat %>% dplyr::select(-n_mutations))
+fisher.test(table(dat %>% dplyr::select(-n_mutations)))
+
+dat = pp_df %>% dplyr::select(c(LOH, n_cns)) %>% dplyr::mutate(CNA_any=n_cns>0) %>% na.omit()
+table(dat %>% dplyr::select(-n_cns))
+fisher.test(table(dat %>% dplyr::select(-n_cns)))
+
+dat = pp_df %>% dplyr::select(c(LOH, n_fusions)) %>% dplyr::mutate(fus_any=n_fusions>0) %>% na.omit()
+table(dat %>% dplyr::select(-n_fusions))
+fisher.test(table(dat %>% dplyr::select(-n_fusions)))
+```
+
+```{r}
+dat = pp_df %>% dplyr::select(c(MSI, muts)) %>% dplyr::mutate(mut_any=muts>2) %>% na.omit()
+table(dat %>% dplyr::select(-muts))
+fisher.test(table(dat %>% dplyr::select(-muts)))
+
+dat = pp_df %>% dplyr::select(c(MSI, CNAs)) %>% dplyr::mutate(CNA_high=CNAs>2) %>% na.omit()
+table(dat %>% dplyr::select(-CNAs))
+fisher.test(table(dat %>% dplyr::select(-CNAs)))
+
+dat = pp_df %>% dplyr::select(c(MSI, fusions)) %>% dplyr::mutate(fus_any=fusions>0) %>% na.omit()
+table(dat %>% dplyr::select(-fusions))
+fisher.test(table(dat %>% dplyr::select(-fusions)))
+```
+
+Fisher exact test for any seizures
+
+```{r}
+pp_df <- pp_df %>% mutate(NEL = ifelse(Seizure.presentation..0.No..1.Yes.,"Early", ifelse(Seizure.presentation.ONLY.after.surgery, "Late", "None")))
+
+dat = pp_df %>% dplyr::select(c(NEL, n_mutations)) %>% dplyr::mutate(mut_high=n_mutations>5.87) %>% na.omit()
+table(dat %>% dplyr::select(-n_mutations))
+fisher.test(table(dat %>% dplyr::select(-n_mutations)))
+
+dat = pp_df %>% dplyr::select(c(NEL, CNAs)) %>% dplyr::mutate(CNA_any=CNAs>7.4) %>% na.omit()
+table(dat %>% dplyr::select(-CNAs))
+fisher.test(table(dat %>% dplyr::select(-CNAs)))
+
+dat = pp_df %>% dplyr::select(c(NEL, n_fusions)) %>% dplyr::mutate(fus_any=n_fusions>4.2) %>% na.omit()
+table(dat %>% dplyr::select(-n_fusions))
+fisher.test(table(dat %>% dplyr::select(-n_fusions)))
+```
+
+```{r}
+dat = pp_df %>% dplyr::select(c(NEL, EGFR.CNA.CND,EGFR.Fusion )) %>% dplyr::mutate(egfr_any=(EGFR.CNA.CND!=0)|(EGFR.Fusion!=0)) %>% na.omit()
+dat_table = table(dat %>% dplyr::select(-c(EGFR.CNA.CND, EGFR.Fusion)))
+fisher.test(dat_table)
+
+dat = pp_df %>% dplyr::select(c(NEL, EGFR.Fusion)) %>% dplyr::mutate(egfr_any=EGFR.Fusion!=0) %>% na.omit()
+table(dat %>% dplyr::select(-EGFR.Fusion))
+fisher.test(table(dat %>% dplyr::select(-EGFR.Fusion)))
+
+dat = pp_df %>% dplyr::select(c(NEL, EGFR.Mutation )) %>% dplyr::mutate(egfr_any=EGFR.Mutation!=0) %>% na.omit()
+table(dat %>% dplyr::select(-EGFR.Mutation))
+fisher.test(table(dat %>% dplyr::select(-EGFR.Mutation)))
+```
+
+Grouping rare variants
+
+```{r}
+fus_singletons = colSums(Caris %>% dplyr::select(contains("Fusion")) != 0)==1
+mut_singletons = colSums(Caris %>% dplyr::select(contains("Mutation")) != 0)==1
+CN_singletons = colSums(Caris %>% dplyr::select(contains("CNA")) != 0)==1
+
+fus_doubletons = colSums(Caris %>% dplyr::select(contains("Fusion")) != 0)==2
+mut_doubletons = colSums(Caris %>% dplyr::select(contains("Mutation")) != 0)==2
+CN_doubletons = colSums(Caris %>% dplyr::select(contains("CNA")) != 0)==2
+
+  
+sum(fus_doubletons)
+sum(mut_doubletons)
+sum(CN_doubletons)
+
+sum(fus_singletons)
+sum(mut_singletons)
+sum(CN_singletons)
+```
+
+```{r}
+Caris_clinical$TMB_numeric = as.numeric(substr(Caris_clinical$TMB,1,2))
+
+fusion_cols = Caris_clinical %>% dplyr::select(contains(".Fusion"))
+singleton_fusions = names(fusion_cols[colSums(Caris_clinical %>% dplyr::select(contains(".Fusion")) != 0)==1])
+Caris_clinical$singleton_fusion = rowSums(Caris_clinical %>% dplyr::select(all_of(singleton_fusions))!=0)
+doubleton_fusions = names(fusion_cols[colSums(Caris_clinical %>% dplyr::select(contains(".Fusion")) != 0)==2])
+Caris_clinical$doubleton_fusion = rowSums(Caris_clinical %>% dplyr::select(all_of(doubleton_fusions))!=0)
+
+mutation_cols = Caris_clinical %>% dplyr::select(contains("Mutation"))
+singleton_mutations = names(mutation_cols[colSums(mutation_cols != 0)==1])
+Caris_clinical$singleton_mutation = rowSums(Caris_clinical %>% dplyr::select(all_of(singleton_mutations))!=0)
+doubleton_mutations = names(mutation_cols[colSums(mutation_cols != 0)==2])
+Caris_clinical$doubleton_mutation = rowSums(Caris_clinical %>% dplyr::select(all_of(doubleton_mutations))!=0)
+
+cna_cols = Caris_clinical %>% dplyr::select(contains("CNA"))
+singleton_cnas = names(cna_cols[colSums(cna_cols != 0)==1])
+Caris_clinical$singleton_cnas = rowSums(Caris_clinical %>% dplyr::select(all_of(singleton_cnas))!=0)
+doubleton_cnas = names(cna_cols[colSums(cna_cols != 0)==2])
+Caris_clinical$doubleton_cnas = rowSums(Caris_clinical %>% dplyr::select(all_of(doubleton_cnas))!=0)
+```
+
+```{r}
+# Rare CNAs
+dat = Caris_clinical %>% dplyr::select(c(Seizure.presentation.ANY, singleton_cnas)) %>% dplyr::mutate(singleton_cnas=singleton_cnas!=0) %>% na.omit()
+dat_table = table(dat)
+print(dat_table)
+fisher.test(dat_table)
+
+dat = Caris_clinical %>% dplyr::select(c(Seizure.presentation.ANY, doubleton_cnas)) %>% dplyr::mutate(doubleton_cnas=doubleton_cnas!=0) %>% na.omit()
+dat_table = table(dat)
+print(dat_table)
+fisher.test(dat_table)
+```
+
+```{r}
+# Rare fusions
+dat = Caris_clinical %>% dplyr::select(c(Seizure.presentation.ANY, singleton_fusion)) %>% dplyr::mutate(singleton_fusion=singleton_fusion!=0) %>% na.omit()
+dat_table = table(dat)
+print(dat_table)
+fisher.test(dat_table)
+
+dat = Caris_clinical %>% dplyr::select(c(Seizure.presentation.ANY, doubleton_fusion)) %>% dplyr::mutate(doubleton_fusion=doubleton_fusion!=0) %>% na.omit()
+dat_table = table(dat)
+print(dat_table)
+fisher.test(dat_table)
+```
+
+```{r}
+#Any singletons
+dat = Caris_clinical %>% dplyr::select(c(Seizure.presentation.ANY, singleton_fusion, singleton_mutation, singleton_cnas)) %>% dplyr::mutate(singletons=(singleton_fusion!=0|singleton_mutation!=0|singleton_cnas!=0)) %>% dplyr::select(Seizure.presentation.ANY,singletons) %>% na.omit()
+dat_table = table(dat)
+print(dat_table)
+fisher.test(dat_table)
+
+#Any doubletons
+dat = Caris_clinical %>% dplyr::select(c(Seizure.presentation.ANY, doubleton_fusion, doubleton_mutation, doubleton_cnas)) %>% dplyr::mutate(doubletons=(doubleton_fusion!=0|doubleton_mutation!=0|doubleton_cnas!=0)) %>% dplyr::select(Seizure.presentation.ANY,doubletons)%>% na.omit()
+dat_table = table(dat)
+print(dat_table)
+fisher.test(dat_table)
+```
+
+```{r}
+multivariable_lm = glm(NEL=='None' ~ 
+                     age + 
+                     sex +
+                     mgmt_methylated +
+                     TMB_numeric + 
+                     MSI + 
+                     LOH, 
+                     data = pp_df %>% filter(mgmt_methylated!="Indeterminate"), 
+                     family = "binomial")
+
+summary(multivariable_lm)
+```
+
+```{r}
+# Example data (you will need to replace this with your actual data)
+data <- data.frame(
+  Allele = rep(c("11:01", "01:01", "02:01", "03:01", "04:01", "05:01"), 3),
+  Population = rep(c(rep("No Seizure", 6), rep("Early Seizure", 6), rep("Late Seizure", 6)),3),
+  Frequency = rep(c(0.293, 0.204, 0.155, 0.01, 0.124, 0.214, 0.293, 0.204, 0.155, 0.01, 0.124, 0.214, 0.293, 0.204, 0.155, 0.1, 0.023, 0.214),3),
+  HLA = rep(c("HLA-A", "HLA-B", "HLA-C"), each = 18)
+)
+
+HLA_df <- pp_df %>% dplyr::select(HLA.A, HLA.B, HLA.C, CodeSeizure)
+frequency_df <- HLA_df  %>% mutate(id = row_number()) %>%
+  tidyr::pivot_longer(cols = starts_with("HLA"), names_to = "HLA", values_to = "alleles") %>%
+  tidyr::separate_rows(alleles, sep = ",") %>%
+  mutate(alleles = gsub("'", "", alleles),  # Remove single quotes
+         HLA_Type = case_when(
+           HLA == "HLA.A" ~ "HLA-A",
+           HLA == "HLA.B" ~ "HLA-B",
+           HLA == "HLA.C" ~ "HLA-C"
+         )) %>%
+  group_by(CodeSeizure, alleles, HLA_Type) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  # Calculate proportions
+  group_by(CodeSeizure, HLA_Type) %>%
+  mutate(total = sum(count)) %>%
+  ungroup() %>%
+  mutate(proportion = count / total) %>%
+  dplyr::select(-count, -total) %>%
+  # Group low-frequency alleles as "other"
+  mutate(alleles = ifelse(proportion < 0.05, "other", alleles)) %>%
+  group_by(CodeSeizure, alleles, HLA_Type) %>%
+  summarise(proportion = sum(proportion), .groups = 'drop') 
+
+
+```
+
+```{r}
+# Function to create pie charts
+plot_pie_chart <- function(df) {
+  # Create a rainbow palette for unique alleles
+  unique_alleles <- unique(df$alleles[df$alleles != "other"])
+  rainbow_colors <- rainbow(length(unique_alleles))
+  
+  # Create a named vector for the fill colors
+  fill_colors <- c(setNames(rainbow_colors, unique_alleles), "other" = "gray")
+  
+  ggplot(df, aes(x = "", y = proportion, fill = alleles)) +
+    geom_bar(stat = "identity", width = 1) +
+    coord_polar("y", start = 0) +
+    facet_grid(HLA_Type ~ CodeSeizure) + 
+    theme_void() +
+    theme(strip.text = element_text(face = "bold")) +
+    scale_fill_manual(values = fill_colors)
+}
+
+
+
+# Plot pie charts
+plot_pie_chart(frequency_df)
+
+```
+
+```{r}
+
+library(stringr)
+pp_df$HLA.A= ifelse(pp_df$HLA.A=='NA',NA,pp_df$HLA.A)
+pp_df$HLA.B= ifelse(pp_df$HLA.B=='NA',NA,pp_df$HLA.B)
+pp_df$HLA.C= ifelse(pp_df$HLA.C=='NA',NA,pp_df$HLA.C)
+
+library(tidyr)
+pp_df_longHLA <- pp_df |>
+separate_wider_delim(HLA.A, delim = ",", names = c("HLA.A1", "HLA.A2"), too_few = "align_end")
+pp_df_longHLA <- pp_df_longHLA |>
+separate_wider_delim(HLA.B, delim = ",", names = c("HLA.B1", "HLA.B2"), too_few = "align_end")
+pp_df_longHLA <- pp_df_longHLA |>
+separate_wider_delim(HLA.C, delim = ",", names = c("HLA.C1", "HLA.C2"), too_few = "align_end")
+
+pp_df_longHLA <- pp_df_longHLA |> tidyr::pivot_longer(cols=c(HLA.A1, HLA.A2, HLA.B1, HLA.B2, HLA.C1, HLA.C2), names_to = c('HLA'), values_to = "HLA.alleles")
+
+pp_df_longHLA$HLA.alleles = sub('\'','', pp_df_longHLA$HLA.alleles)
+```
+
+## Plotting HLA genotype distributions
+
+```{r}
+library(patchwork)
+# Combine HLA allele columns
+
+allele_combinationsA <- pp_df %>%
+  group_by(HLA.A) %>%
+  summarize(Frequency = n(), Seizure_Frequency = sum(Seizure.presentation..0.No..1.Yes.)) %>%
+  arrange(desc(Frequency))
+
+allele_combinationsB <- pp_df %>%
+  group_by(HLA.B) %>%
+  summarize(Frequency = n(), Seizure_Frequency = sum(Seizure.presentation..0.No..1.Yes.)) %>%
+  arrange(desc(Frequency))
+
+allele_combinationsC <- pp_df %>%
+  group_by(HLA.C) %>%
+  summarize(Frequency = n(), Seizure_Frequency = sum(Seizure.presentation..0.No..1.Yes.)) %>%
+  arrange(desc(Frequency))
+
+# Plot the most frequent allele combinations
+plotA <- ggplot(allele_combinationsA  %>%
+  filter(Frequency > 1), aes(x = reorder(HLA.A, -Frequency), y = Frequency, fill=Seizure_Frequency/Frequency)) +
+  geom_bar(stat = "identity") +
+  labs(title="A", x = "Allele Combination", y = "Frequency") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_gradient(low = "blue", high = "red", name = "Seizure Frequency")+
+  guides(fill = "none")
+
+
+plotB <- ggplot(allele_combinationsB  %>%
+  filter(Frequency > 1), aes(x = reorder(HLA.B, -Frequency), y = Frequency, fill=Seizure_Frequency/Frequency)) +
+  geom_bar(stat = "identity") +
+  labs(title="B", x = "Allele Combination", y = "Frequency") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_gradient(low = "blue", high = "red", name = "Seizure Frequency")+
+  guides(fill = "none")  + ylim(c(0,5))
+
+
+plotC <- ggplot(allele_combinationsC %>% filter(Frequency > 1), aes(x = reorder(HLA.C, -Frequency), y = Frequency, fill = Seizure_Frequency / Frequency)) +
+  geom_bar(stat = "identity") +
+  labs(title="C", x="Allele Combination", y = "Frequency") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  scale_fill_gradient(low = "blue", high = "red", name = "Proportion with \nEarly Seizures") + ylim(c(0,5))
+
+
+
+# Combine the plots into a single figure
+combined_plot <- plotA + plotB + plotC + plot_layout(nrow = 1)
+
+png(filename = "HLA_combination.png", width=25, height=15, units = "cm", res=250, type = "cairo")
+
+# Display the combined plot
+print(combined_plot)
+
+
+dev.off()
+```
+
+```{r}
+
+# Function to separate alleles and calculate frequency
+calculate_allele_frequency <- function(data, column_name) {
+  # Split the alleles and convert to long format, ensuring unique counts per individual
+  alleles <- data %>%
+    separate_rows(!!sym(column_name), sep = ",") %>%
+    distinct(Deidentified.code, !!sym(column_name), .keep_all = TRUE) %>%
+    group_by(Allele = !!sym(column_name)) %>%
+    summarize(Frequency = n(), Seizure_Frequency = sum(Seizure.presentation..0.No..1.Yes.)) %>%
+    arrange(desc(Frequency))
+  
+  return(alleles)
+}
+
+
+calculate_allele_hetero <- function(data, column_name) {
+  # Split the alleles and convert to long format, ensuring unique counts per individual
+  alleles <- data %>%
+    separate_rows(!!sym(column_name), sep = ",") %>%
+    group_by(Deidentifed.code) %>%
+    summarize(Frequency = n(unique(!!sym(column_name))), Seizure_Frequency = sum(Seizure.presentation..0.No..1.Yes.)) %>%
+    arrange(desc(Frequency))
+  
+  return(alleles)
+}
+
+
+# Calculate frequencies for each HLA type
+allele_freq_A <- calculate_allele_frequency(pp_df %>% dplyr::select(Deidentified.code, 
+                                                             HLA.A, Seizure.presentation..0.No..1.Yes.), "HLA.A")
+allele_freq_B <- calculate_allele_frequency(pp_df %>% dplyr::select(Deidentified.code, 
+                                                             HLA.B, Seizure.presentation..0.No..1.Yes.), "HLA.B")
+allele_freq_C <- calculate_allele_frequency(pp_df %>% dplyr::select(Deidentified.code, 
+                                                             HLA.C, Seizure.presentation..0.No..1.Yes.), "HLA.C")
+
+# Combine all frequencies into one data frame
+allele_freq <- bind_rows(
+  allele_freq_A %>% mutate(HLA_Type = "A"),
+  allele_freq_B %>% mutate(HLA_Type = "B"),
+  allele_freq_C %>% mutate(HLA_Type = "C")
+)
+
+allele_freq <- allele_freq %>% filter(Frequency>2) 
+
+# Plot the most frequent alleles
+ggplot(allele_freq, aes(x = reorder(Allele, -Frequency), y = Frequency, fill = Seizure_Frequency/Frequency)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~HLA_Type, scales = "free_x") +
+  labs(x = "Allele", y= "Frequency") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  scale_fill_gradient(low = "blue", high = "red", name = "Proportion with \nEarly Seizures")
+
+ggsave('HLA_GenotypeIndividual.png', width = 10, height=5, unit="in",dpi=350)
+
+
+
+```
+
+```{r}
+
+# Create a binary indicator for HLA-A*02:01 presence
+
+pp_df <- pp_df %>%
+  mutate(HLA_A_0101_present = grepl("01:01", HLA.A))
+
+# Create contingency table
+hlaB_table <- table(pp_df$HLA_A_0101_present, pp_df$CodeSeizure==2)
+
+# View the table (optional)
+print(hlaB_table)
+
+# Run Fisher's Exact Test
+fisher_test_result <- fisher.test(hlaB_table)
+
+# Print result
+print(fisher_test_result)
+
+
+# Create a binary indicator for HLA-A*02:01 presence
+
+pp_df <- pp_df %>%
+  mutate(HLA_A_0201_present = grepl("02:01", HLA.A))
+
+# Create contingency table
+hla_table <- table(pp_df$HLA_A_0201_present, pp_df$CodeSeizure==0)
+
+# View the table (optional)
+print(hla_table)
+
+# Run Fisher's Exact Test
+fisher_test_result <- fisher.test(hla_table)
+
+# Print result
+print(fisher_test_result)
+
+# Create a binary indicator for HLA-A*02:01 presence
+pp_df <- pp_df %>%
+  mutate(HLA_A_2501_present = grepl("25:01", HLA.A))
+
+# Create contingency table
+hla_table <- table(pp_df$HLA_A_2501_present, pp_df$CodeSeizure==0)
+
+# View the table (optional)
+print(hla_table)
+
+# Run Fisher's Exact Test
+fisher_test_result <- fisher.test(hla_table)
+
+# Print result
+print(fisher_test_result)
+
+```
+
+Calculate heterozygosity of HLA A,B,C
+
+```{r}
+homo_het <- pp_df %>% dplyr::select(Deidentified.code, HLA.A, Seizure.presentation..0.No..1.Yes.) %>% 
+    separate_rows(HLA.A, sep = ",") %>% unique() %>% group_by(Deidentified.code) %>% summarize(Frequency = n())
+
+pp_df$HLAhomo = homo_het$Frequency
+
+homo_het <- pp_df %>% dplyr::select(Deidentified.code, HLA.B, Seizure.presentation..0.No..1.Yes.) %>% 
+    separate_rows(HLA.B, sep = ",") %>% unique() %>% group_by(Deidentified.code) %>% summarize(Frequency = n())
+
+pp_df$HLBhomo = homo_het$Frequency
+
+homo_het <- pp_df %>% dplyr::select(Deidentified.code, HLA.C, Seizure.presentation..0.No..1.Yes.) %>% 
+    separate_rows(HLA.C, sep = ",") %>% unique() %>% group_by(Deidentified.code) %>% summarize(Frequency = n())
+
+pp_df$HLChomo = homo_het$Frequency
+```
+
+https://pmc.ncbi.nlm.nih.gov/articles/PMC8921139/
+
+```{r}
+hla_0201_table <- table(pp_df$HLA_A_0201_present, pp_df$CodeSeizure)
+# View the table (optional)
+print(hla_0201_table)
+
+# Contingency table at one level of a third factor 
+table_int <- with(pp_df %>% dplyr::filter(CodeSeizure!="2"), table(TERT.Mutation, PTEN.Mutation=="Positive"))
+
+# Fisher Exact test 
+fisher.test(table_int)
+```
+
+```{r}
+library(MASS)
+
+lda_data = pp_df %>% dplyr::select(CodeSeizure, HLA_A_0201_present, HLA_B_0801_present, EGFR.Mutation, muts, CNAs, PTEN.Mutation, TP53.Mutation, IDH1.Mutation, TERT.Mutation, NF1.Mutation, STK11.CNA.CND, age) 
+
+lda_model <- lda(CodeSeizure==0 ~ ., data = lda_data )
+
+# View model
+print(lda_model)
+lda_pred <- predict(lda_model)
+
+# Confusion matrix
+table(Predicted = lda_pred$class, Actual = lda_data$CodeSeizure==0)
+
+# Optional: accuracy
+mean(lda_pred$class == (lda_data$CodeSeizure==0))
+
+lda_importance <- abs(lda_model$scaling[,1])
+sort(lda_importance, decreasing = TRUE)
+
+```
+
+```{r}
+predictor_vars <- c("EGFR.Mutation", "TP53.Mutation", "EGFR.CNA.CND", "IDH1.Mutation", "PTEN.Mutation", "TERT.Mutation", "NF1.Mutation", "PIK3CA.Mutation", "SETD2.Mutation", "TIMM23B.Fusion", "STK11.CNA.CND", "MEF2B.CNA.CND", "MAP2K2.CNA.CND", "EGFR.Fusion", "PDCD1.CNA.CND", "CIC.CNA.CND", "JAK3.CNA.CND")  # example
+
+
+# Prepare results list
+lda_results <- list()
+
+# Loop over all 2-variable combinations
+combo_matrix <- combn(predictor_vars, 2)
+
+for (i in 1:ncol(combo_matrix)) {
+  vars <- combo_matrix[, i]
+  temp_df <- pp_df %>%
+    dplyr::select(CodeSeizure, all_of(vars)) %>%
+    dplyr::filter(complete.cases(.)) %>%
+    mutate(CodeSeizure = factor(CodeSeizure))
+
+  if (nrow(temp_df) < 5 || n_distinct(temp_df$CodeSeizure) < 2) {
+    next  # skip if too few rows or only one class
+  }
+
+  lda_model <- lda(CodeSeizure ~ ., data = temp_df)
+  pred <- predict(lda_model)
+  acc <- mean(pred$class == temp_df$CodeSeizure)
+  
+  result <- tibble(
+    Var1 = vars[1],
+    Var2 = vars[2],
+    Var3 = vars[3],
+    Accuracy = acc
+  )
+  lda_results[[length(lda_results) + 1]] <- result
+}
+
+# Combine into one data frame
+lda_summary <- bind_rows(lda_results)
+
+# View top combinations
+lda_summary %>%
+  arrange(desc(Accuracy)) %>%
+  print(n = 10)
+
+
+library(ggplot2)
+
+# Plot top 10 by accuracy
+lda_summary %>%
+  arrange(desc(Accuracy)) %>%
+  slice_head(n = 10) %>%
+  ggplot(aes(x = Accuracy, y = reorder(paste(Var1, Var2, sep = " + "), Accuracy))) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Top 10 Variable Pairs by LDA Accuracy",
+       y = "Variable Pair", x = "Accuracy") +
+  theme_minimal()
+```
+
+```{r}
+n_boot <- 100  # number of bootstrap iterations for null model
+
+for (i in 1:ncol(combo_matrix)) {
+  vars <- combo_matrix[, i]
+  temp_df <- pp_df %>%
+    dplyr::select(CodeSeizure, all_of(vars)) %>%
+    dplyr::filter(complete.cases(.)) %>%
+    mutate(CodeSeizure = factor(CodeSeizure))
+
+  if (nrow(temp_df) < 5 || n_distinct(temp_df$CodeSeizure) < 2) next
+
+  # True model
+  lda_model <- tryCatch(lda(CodeSeizure ~ ., data = temp_df), error = function(e) return(NULL))
+  if (is.null(lda_model)) next
+  pred <- predict(lda_model)
+  acc_true <- mean(pred$class == temp_df$CodeSeizure)
+
+  # Bootstrapped null accuracies
+  boot_acc <- replicate(n_boot, {
+    shuffled_df <- temp_df %>%
+      mutate(CodeSeizure = sample(CodeSeizure))  # permute labels
+
+    boot_model <- tryCatch(lda(CodeSeizure ~ ., data = shuffled_df), error = function(e) return(NA))
+    #if (is.na(boot_model)) return(NA)
+
+    pred_boot <- predict(boot_model)
+    mean(pred_boot$class == shuffled_df$CodeSeizure)
+  })
+
+  boot_acc <- boot_acc[!is.na(boot_acc)]
+
+  # p-value: proportion of null accuracies >= true accuracy
+  p_val <- mean(boot_acc >= acc_true)
+
+  # Coefficients (if present)
+  scaling_names <- rownames(lda_model$scaling)
+  #coef_var1 <- if (vars[1] %in% scaling_names) lda_model$scaling[vars[1], 1] else NA
+  #coef_var2 <- if (vars[2] %in% scaling_names) lda_model$scaling[vars[2], 1] else NA
+
+  result <- tibble(
+    Var1 = vars[1],
+    Var2 = vars[2],
+    Accuracy = acc_true,
+    NullMean = mean(boot_acc),
+    NullSD = sd(boot_acc),
+  Null_Lower = quantile(boot_acc, 0.025, na.rm = TRUE),
+  Null_Upper = quantile(boot_acc, 0.975, na.rm = TRUE),
+  P_Value = mean(boot_acc >= acc_true),
+  #Coef_Var1 = coef_var1,
+  #Coef_Var2 = coef_var2
+  )
+  lda_results[[length(lda_results) + 1]] <- result
+}
+
+```
+
+```{r}
+lda_summary <- bind_rows(lda_results)
+
+# Plot top 10 real vs null accuracy
+top10 <- lda_summary %>%
+  arrange(P_Value) %>%
+  slice_head(n = 10)
+
+ggplot(top10, aes(x = reorder(paste(Var1, Var2, sep = " + "), Accuracy))) +
+  geom_point(aes(y = Accuracy), color = "steelblue") +
+  geom_point(aes(y = NullMean), color = "red", size = 2) +
+  geom_errorbar(aes(ymin = Null_Lower, ymax = Null_Upper), color = "red", width = 0.2) +
+  coord_flip() +
+  labs(title = "Top 10 LDA Pairs vs Null Model",
+       y = "Accuracy", x = "Variable Pair",
+       subtitle = "Blue = True Accuracy; Red = Null Mean ± .95 CI") +
+  theme_minimal()
+
+```
+
+```{r}
+# Create contingency table
+hla_homo_table <- table(pp_df$HLAhomo, pp_df$CodeSeizure)
+
+# View the table (optional)
+print(hla_homo_table)
+
+# Run Fisher's Exact Test
+fisher_test_result <- fisher.test(hla_homo_table)
+
+# Print result
+print(fisher_test_result)
+
+```
+
+```{r}
+library(forcats)
+pp_df_longHLA <- pp_df_longHLA |> mutate(sex=as.factor(sex)) |> mutate(sex=lvls_revalue(sex,c('M','F')))
+pp_df_longHLA <- pp_df_longHLA |> mutate(mgmt_methylated=as.factor(mgmt_methylated))
+pp_df_longHLA <- pp_df_longHLA |> mutate(mgmt_methylated=lvls_revalue(mgmt_methylated,c('Not Methylated','Methylated','Indeterminate')))
+pp_df_longHLA <- pp_df_longHLA |> rename(Sz_Pre_Diagnosis=Seizure.presentation..0.No..1.Yes.)
+
+
+# Rename, only ever needed once per session
+#pp_df_longHLA <- pp_df_longHLA |> mutate(Seizure.presentation=lvls_revalue(Seizure.presentation,c('None', 'Seizures')))
+#pp_df_longHLA <- pp_df_longHLA |> mutate(Seizure.presentation=as.factor(Seizure.presentation))
+```
+
+```{r}
+# Highest frequency to lowest frequency HLA
+
+for (i in c('A','B','C')){ ggplot(pp_df_longHLA %>% na.omit() %>% 
+           filter(grepl(i, 
+                        HLA.alleles)) %>% 
+           filter(mgmt_methylated!='Indeterminate'), 
+         aes(y=fct_infreq(HLA.alleles), fill=Seizure.presentation..0.No..1.Yes.)) + 
+    geom_bar(position="stack") + 
+    facet_grid(mgmt_methylated~sex)+ 
+    ylab(paste0('HLA-',i,' Genotype'))
+  ggsave(paste0('HLA_Genotype_Dist',i,'.png'), width = 6, height=8)
+       }
+```
+
+### Table for NGS Sequenced Data
+
+```{r}
+#Load package
+library(tableone)
+
+pp_df$NF1_mut = pp_df$NF1.Mutation!="0"
+pp_df$PIK3CA_mut = pp_df$PIK3CA.Mutation!="0"
+pp_df$PIK3R1_mut = pp_df$PIK3R1.Mutation!="0"
+pp_df$PTEN_mut = pp_df$PTEN.Mutation!="0"
+pp_df$EGFR_mut = pp_df$EGFR.Mutation!="0"
+pp_df$TERT_mut = pp_df$TERT.Mutation!="0"
+pp_df$IDH1_mut = pp_df$IDH1.Mutation!="0"
+pp_df$TP53_mut = pp_df$TP53.Mutation!="0"
+pp_df$SETD2_mut = pp_df$SETD2.Mutation!="0"
+pp_df$EGFR_fus = pp_df$EGFR.Fusion!="0"
+pp_df$TIMM23B_fus = pp_df$TIMM23B.Fusion!="0"
+pp_df$EGFR_cn = pp_df$EGFR.CNA.CND!="0"
+pp_df$STK11_cn = pp_df$STK11.CNA.CND!="0"
+
+
+
+#Create a variable list which we want in Table 1
+listVars <- c("age", "TMB_numeric", "muts", "fusions","n_mutations", "n_fusions", "CNAs")
+
+#Define categorical variables
+catVars <- c("sex","Seizure.presentation..0.No..1.Yes.","Seizure.presentation.ONLY.after.surgery", "LOH", "MSI") 
+
+pp_df_tb1 <- pp_df |> filter(!is.na(MSI)) |> dplyr::select(!contains('.Mutation')) |> dplyr::select(!ends_with('.Fusion')) |> dplyr::select(!contains('CND')) |> dplyr::select(!TMB) |> dplyr::select(!NEL) |> dplyr::select(!Sz_Pre_Diagnosis) |> mutate(CodeSeizure=Seizure.presentation..0.No..1.Yes.*1 + Seizure.presentation.ONLY.after.surgery*2) |> dplyr::select(!starts_with("Deidentif")) |> mutate(across(catVars, as.factor)) |> mutate(across(starts_with("loc"), as.factor)) |> mutate(across(c(CodeSeizure,race, mgmt_methylated, idh1_mutated), as.factor)) |> mutate(across(ki_67,as.numeric)) |> mutate(HLA.A=grepl(x=HLA.A,pattern="A*02:01"), HLA.B=grepl(x=HLA.B,pattern="B*44"), HLA.C=grepl(x=HLA.C,pattern="C*07")) 
+
+# Create summary table using gtsummary
+library(gtsummary)
+
+#table1 <- CreateTableOne(data = pp_df_tb1 %>% dplyr::select(!starts_with('Sei')) ,addOverall = TRUE,includeNA = TRUE, strata ='CodeSeizure' )
+table1 <- tbl_summary(
+    pp_df_tb1 %>% dplyr::select(!starts_with('Sei')),
+    by = CodeSeizure,# split table by group 
+    type = list(kps_at_diagnosis ~ "continuous"),
+    ) %>%
+  add_n() %>% # add column with total number of non-missing observations
+  add_p() # test for a difference between groups
+
+table1
+
+
+```
+
+### Export to Word!
+
+```{r}
+#table1 <- pp_df%>% dplyr::select(catVars, listVars)
+# Load the packages
+#library(ReporteRs) # Not maintained
+library(magrittr)
+library(flextable)
+library(officer)
+
+
+doc <- read_docx()
+# The script
+doc %>% 
+     body_add_flextable(table1 %>%
+     as_flex_table(.) %>%
+               theme_zebra( odd_body = "#DDDDDD", even_body = "#FFFFFF" ) ) %>%
+     print(.,target = "GBMEpilepsytable.docx")
+
+```
+
+```{r}
+high_cns = names(sort(varcounts_cn[varcounts_cn>2], decreasing=TRUE))
+high_cns = sub(".CNA.CND", "", high_cns)
+write.csv(high_cns, row.names = FALSE, quote=FALSE)
+
+high_muts = names(sort(varcounts_mut[varcounts_mut>2], decreasing=TRUE))
+high_muts = sub(".Mutation", "", high_muts)
+
+write.csv(high_muts, row.names = FALSE, quote=FALSE)
+write.csv(high_cns, row.names = FALSE, quote=FALSE)
+
+#Input into GOrilla:
+
+```
+
+```{r}
+#Gene set enrichment by group
+NoS_varCN <- colSums(pp_df %>% dplyr::filter(NEL=="None") %>% dplyr::select(contains("CNA.")) != 0)
+NoS_varmut <- colSums(pp_df %>% dplyr::filter(NEL=="None") %>% dplyr::select(contains(".Mut")) != 0)
+
+Early_varCN <- colSums(pp_df %>% dplyr::filter(NEL=="Early") %>% dplyr::select(contains("CNA.")) != 0)
+Early_varmut <- colSums(pp_df %>% dplyr::filter(NEL=="Early") %>% dplyr::select(contains(".Mut")) != 0)
+
+Late_varCN<- colSums(pp_df %>% dplyr::filter(NEL=="Late") %>% dplyr::select(contains("CNA.")) != 0)
+Late_varmut <- colSums(pp_df %>% dplyr::filter(NEL=="Late") %>% dplyr::select(contains(".Mut")) != 0)
+
+export_go <- function(named_freq, string_, threshold=3){
+  
+  high = names(sort(named_freq[named_freq>threshold], decreasing=TRUE))
+  high = sub(paste0(string_,"*"), "", high)
+  write.csv(high, row.names = FALSE, quote=FALSE)
+  
+}
+
+combine_go <- function(named_freq, string_, threshold=3){
+  
+  high = names(sort(named_freq[named_freq>threshold], decreasing=TRUE))
+  high = sub(".Mutation", "", high)
+  high = sub(".CNA.CND", "", high)
+  write.csv(high, row.names = FALSE, quote=FALSE)
+  
+}
+
+combine_go(Early_varCN, Early_varmut)
+```
+
+```{r}
+for (i in names(mut_top_full)){
+  print(i)
+  g1=pp_df$n_fusions[pp_df[[i]]=="Positive"]
+  g2=pp_df$n_fusions[pp_df[[i]]!="Positive"]
+  if (length(g1)>2){
+    print(t.test(g1,g2))}
+}
+
+for (i in cn_top_full){
+  print(i)
+  g1=pp_df$n_mutations[pp_df[[i]]%in%c("Amplified","Deleted")]
+  g2=pp_df$n_mutations[!(pp_df[[i]]%in%c("Amplified","Deleted"))]
+  if (length(g1)>2){
+    print(t.test(g1,g2))}
+}
+
+```
+
+### Tumor Mutation Burden and HLA genotype distribution
+
+```{r}
+
+pp_df_longHLA <- pp_df_longHLA |> mutate(TMB_group=lvls_revalue(as.factor(ntile(TMB_numeric,2)), c('High','Low')))
+
+# Rename, only ever needed once per session
+#pp_df_longHLA <- pp_df_longHLA |> mutate(Seizure.presentation=lvls_revalue(Seizure.presentation,c('None', 'Seizures')))
+#pp_df_longHLA <- pp_df_longHLA |> mutate(Seizure.presentation=as.factor(Seizure.presentation))
+#pp_df_longHLA <- pp_df_longHLA |> rename(Pre_Diagnosis_Seizures=Seizure.presentation)
+
+
+# Highest frequency to lowest frequency (fct_infreq())
+for (i in c('A','B','C')){ ggplot(pp_df_longHLA %>% na.omit() %>% 
+           filter(grepl(i, 
+                        HLA.alleles)) %>% 
+           filter(mgmt_methylated!='Indeterminate'), 
+         aes(y=fct_infreq(HLA.alleles), fill=TMB_group)) + 
+    geom_bar(position="stack") + 
+    facet_grid(mgmt_methylated~sex)+ 
+    ylab(paste0('HLA-',i,' Genotype'))
+  ggsave(paste0('HLA_Genotype_TMB_',i,'.png'), width = 6, height=8)
+       }
+
+```
+
+Hierarchical Clustering
+
+```{r}
+
+
+pp_df_longHLA <- pp_df_longHLA |> mutate(CodeSeizure=Sz_Pre_Diagnosis*1 + Seizure.presentation.ONLY.after.surgery*2) |> mutate(CodeSeizure=as.factor(CodeSeizure))
+
+binary_data <- model.matrix(~ . - 1, data = pp_df_longHLA %>% dplyr::select(-id_cols[1:4]) %>% dplyr::select(contains(".Fusion")) %>% mutate_all(as.factor))
+
+# Calculate Jaccard distance
+jaccard_dist <- daisy(binary_data, metric = "gower")
+
+# Perform hierarchical clustering
+hclust_result <- hclust(jaccard_dist, method = "complete")
+
+# Create dendrogram
+dend <- as.dendrogram(hclust_result)
+
+# Sample labels and corresponding colors
+sample_labels <- as.factor(pp_df_longHLA$CodeSeizure)
+colors <- c("red", "blue", "green", "orange")
+
+# Assign colors to labels
+label_colors <- colors[as.numeric(sample_labels)][hclust_result$order]
+#labels_colors(dend) <- label_colors
+
+# Plot dendrogram with colored labels
+plot(dend, main = "Hierarchical Clustering Dendrogram (Mutation data)", xlab = "Samples", sub = NULL, horiz = FALSE, )
+```
+
+```{r}
+# Convert categorical data to binary indicators
+pp_df_longHLA <- pp_df_longHLA |> mutate(CodeSeizure=Sz_Pre_Diagnosis*1 + Seizure.presentation.ONLY.after.surgery*2) |> mutate(CodeSeizure=as.factor(CodeSeizure))
+
+binary_data <- model.matrix(~ . - 1, data = pp_df_longHLA %>% dplyr::select(-id_cols[1:4]) %>% dplyr::select(contains("Mutation")) %>% mutate_all(as.factor))
+
+# Calculate Jaccard distance
+jaccard_dist <- daisy(binary_data, metric = "gower")
+
+# Perform hierarchical clustering
+hclust_result <- hclust(jaccard_dist, method = "complete")
+
+# Create dendrogram
+dend <- as.dendrogram(hclust_result)
+
+# Sample labels and corresponding colors
+sample_labels <- as.factor(pp_df_longHLA$CodeSeizure)
+colors <- c("red", "blue", "green", "orange")
+
+# Assign colors to labels
+label_colors <- colors[as.numeric(sample_labels)][hclust_result$order]
+#labels_colors(dend) <- label_colors
+
+# Plot dendrogram with colored labels
+plot(dend, main = "Hierarchical Clustering Dendrogram (Mutation data)", xlab = "Samples", sub = NULL, horiz = FALSE, )
+```
+
+```{r}
+# Convert categorical data to binary indicators
+pp_df_longHLA <- pp_df_longHLA |> mutate(CodeSeizure=Sz_Pre_Diagnosis*1 + Seizure.presentation.ONLY.after.surgery*2) |> mutate(CodeSeizure=as.factor(CodeSeizure))
+
+binary_data <- model.matrix(~ . - 1, data = pp_df_longHLA %>% dplyr::select(-id_cols[1:4]) %>% dplyr::select(contains("CND")) %>% mutate_all(as.factor))
+
+# Calculate Jaccard distance
+jaccard_dist <- daisy(binary_data, metric = "gower")
+
+# Perform hierarchical clustering
+hclust_result <- hclust(jaccard_dist, method = "complete")
+
+# Create dendrogram
+dend <- as.dendrogram(hclust_result)
+
+# Sample labels and corresponding colors
+sample_labels <- as.factor(pp_df_longHLA$CodeSeizure)
+colors <- c("red", "blue", "green", "orange")
+
+# Assign colors to labels
+label_colors <- colors[as.numeric(sample_labels)][hclust_result$order]
+labels_colors(dend) <- label_colors
+
+# Plot dendrogram with colored labels
+plot(dend, main = "Hierarchical Clustering Dendrogram (Mutation data)", xlab = "Samples", sub = NULL, horiz = FALSE, )
+```
+
+```{r}
+# Install and load necessary packages
+#install.packages("dendextend")
+library(dendextend)
+
+# Convert categorical data to binary indicators
+binary_data <- model.matrix(~ . - 1, data = as.data.frame(lapply(pp_df_longHLA %>% dplyr::select(-id_cols[1:4]) %>% dplyr::select(contains("Fusion")), as.factor)))
+
+# Calculate Jaccard distance
+jaccard_dist <- daisy(binary_data, metric = "gower")
+
+# Perform hierarchical clustering
+hclust_result <- hclust(jaccard_dist, method = "complete")
+
+# Create dendrogram
+dend <- as.dendrogram(hclust_result)
+
+# Sample labels and corresponding colors
+sample_labels <- as.factor(pp_df_longHLA$CodeSeizure)
+colors <- c("red", "blue", "green", "orange")
+
+# Assign colors to labels
+label_colors <- colors[as.numeric(sample_labels)][hclust_result$order]
+labels_colors(dend) <- label_colors
+
+# Plot dendrogram with colored labels
+plot(dend, main = "Hierarchical Clustering Dendrogram (Gene fusion data)", xlab = "Samples", sub = NULL, horiz = FALSE, )
+```
+
+Random Forest - not useful (worse than random)
+
+```{r}
+# Install and load necessary packages
+#install.packages("randomForest")
+library(randomForest)
+
+pp_df <- left_join(pp_df, Caris_clinical %>% dplyr::select(c(Deidentified.code,contains("ton"), chemo_tx_cytotoxic, chemo_tx_biol_targ)))
+
+rare_cols <- grep("ton", names(pp_df), value = TRUE)
+loc_columns <-  grep("loc", names(pp_df), value = TRUE)
+mut_columns <-  grep("Mutation", names(pp_df), value = TRUE)
+cn_columns <-  grep("CND", names(pp_df), value = TRUE)
+
+pp_df <- pp_df %>% na.omit()
+
+### Classification column 
+pp_df$Class <- as.factor(pp_df$CodeSeizure)
+
+equal_0 <- function(x){ return(x==0)}
+
+### Columns for classification
+'c(Class, p53_percent_reactivity, age, ki_67, muts, CNAs, fusions, TMB_numeric, sex, loc_columns, cn_top, fus_top, rare_cols)'
+
+### Test/Train split 
+split_index = sample(1:nrow(pp_df %>% dplyr::select(-CodeSeizure)), 0.7*nrow(pp_df %>% dplyr::select(-CodeSeizure)))
+
+train_data = (pp_df %>%  dplyr::select(-c(Deidentified.code,CodeSeizure)))[split_index, ]  %>% dplyr::select(Class, chemo_tx_biol_targ,p53_percent_reactivity, age, ki_67, muts, CNAs, fusions, TMB_numeric, sex, rare_cols, loc_columns, names(fus_top)[1:2], names(cn_top)[1:5], names(mut_top)[1:5]) %>% mutate(across(c(names(fus_top)[1:2], names(cn_top)[1:5], names(mut_top)[1:5]), equal_0))
+train_data$ki_67 =as.numeric(train_data$ki_67)
+
+test_data = (pp_df %>% dplyr::select(-c(Deidentified.code,CodeSeizure)))[-split_index, ]  %>% dplyr::select(Class, chemo_tx_biol_targ, loc_columns, p53_percent_reactivity, age, ki_67, muts, CNAs, fusions, TMB_numeric, sex, rare_cols, names(fus_top)[1:2], names(cn_top)[1:5], names(mut_top)[1:5]) %>% mutate(across(c(names(fus_top)[1:2], names(cn_top)[1:5], names(mut_top)[1:5]), equal_0))
+
+test_data$ki_67 =as.numeric(test_data$ki_67)
+
+
+rf_model <- randomForest(Class ~ ., data = train_data, ntree = 10, max_depth=6, na.action=na.omit)
+predictions <- predict(rf_model, test_data)
+confusion_matrix <- table(predictions, test_data$Class)
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+print(confusion_matrix)
+print(paste("Accuracy:", round(accuracy, 2)))
+print(importance(rf_model))
+
+```
+
+Generalised linear model (glmnet + caret) - not useful
+
+```{r, eval=FALSE}
+set.seed(61)
+library(glmnet)
+library(caret)
+
+# this method controls everything about training
+# we will just set up 10-fold cross validation
+trctrl <- trainControl(method = "cv",number=10)
+
+col_zeros = names(which(colSums(train_data==0) == nrow(train_data)))
+# we will now train elastic net model
+# it will try
+enetFit <- train(Class~., data = train_data %>%na.omit() %>% dplyr::select(!col_zeros), 
+                 method = "glmnet",  
+                 trControl=trctrl,
+                 na.action = na.omit,
+                 # alpha and lambda paramters to try
+                 tuneGrid = data.frame(alpha=0.05,
+                                       lambda=seq(0.05,0.9,0.01)))
+
+# best alpha and lambda values by cross-validation accuracy
+enetFit$bestTune
+
+#test_data =test_data %>%na.omit() %>% dplyr::select(!col_zeros)
+
+class.res=predict(enetFit,test_data[,-1])
+confusionMatrix(test_data$Class,class.res)$overall[1]
+
+confusionMatrix(class.res, test_data$Class)
+
+plot(varImp(enetFit),top=10)
+
+```
+
+## Other plots
+
+```{r}
+ggplot(pp_df, aes(y=CNAs, x="Copy Number Alterations")) +
+  geom_boxplot(fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(x='', y = "Frequency") + 
+  theme_minimal() 
+ggsave(file="CNAs.png", width=2, height=4, dpi=300)
+```
+
+## PVClust (p-values of hierarchical clustering)
+
+```{r}
+library(pvclust)
+df=as.data.frame(as.data.frame(Caris_red%>% dplyr::select(-c(Deidentified.code, TMB, MSI, LOH, HLA.A, HLA.B, HLA.C, TMB_numeric)) %>% lapply(as.numeric)) %>% sapply(is_na))
+m_df = as.matrix(df)
+m=m_df*1
+result <- pvclust(m, method.dist="binary", method.hclust="average", nboot=1000, parallel=TRUE)
+plot(result)
+pvrect(result, alpha=0.95)
+seplot(result, identify=FALSE)
+```
+
+```{r}
+# install.packages("dendextend")
+library(dendextend)
+hc=hclust(dist(df, method="binary"))
+dend <- as.dendrogram(hc)
+# Like: 
+# dend <- small_iris[,-5] %>% dist %>% hclust %>% as.dendrogram
+
+# By default, the dend has no colors to the labels
+labels_colors(dend)
+## NULL
+par(mfrow = c(1,2))
+plot(dend, main = "Original dend")
+
+# Let's add some color:
+colors_to_use <- as.numeric(pp_df$CodeSeizure)
+colors_to_use
+## [1] 1 2 3 1 2 3
+# But sort them based on their order in dend:
+colors_to_use <- colors_to_use[order.dendrogram(dend)]
+colors_to_use
+## [1] 1 1 2 2 3 3
+# Now we can use them
+labels_colors(dend) <- colors_to_use
+# Now each state has a color
+labels_colors(dend) 
+
+##   1   2  51  52 101 102 
+##   1   1   2   2   3   3
+plot(dend, main = "Colored by Seizure Status")
+
+clusts=cutree(hc, k=4)
+clusts = clusts[order.dendrogram(dend)]
+M=table(clusts,colors_to_use)
+dimnames(M) <- list(Hierarchical = c("1","2", "3","4"),Seizures = c("None", "Early", "Late"))
+
+```
+
+```{r}
+
+
+```
